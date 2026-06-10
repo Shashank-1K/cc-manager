@@ -1,0 +1,1998 @@
+$script:PROFILES_DIR = Join-Path $PSScriptRoot "profiles"
+. "$PSScriptRoot\v2-core.ps1"
+. "$PSScriptRoot\providers.ps1"
+
+function Set-SafeCursorPosition {
+    param(
+        [int]$Left,
+        [int]$Top,
+        [switch]$ScrollIfBeyond
+    )
+    $bufferHeight = 100
+    try { $bufferHeight = [Console]::BufferHeight } catch {}
+    
+    if ($Top -ge $bufferHeight) {
+        $scrollAmount = $Top - $bufferHeight + 1
+        try {
+            [Console]::SetCursorPosition($Left, $bufferHeight - 1)
+        } catch {}
+        if ($ScrollIfBeyond) {
+            for ($i = 0; $i -lt $scrollAmount; $i++) {
+                Write-Host ""
+            }
+        }
+    } elseif ($Top -lt 0) {
+        try { [Console]::SetCursorPosition($Left, 0) } catch {}
+    } else {
+        try { [Console]::SetCursorPosition($Left, $Top) } catch {}
+    }
+}
+
+function Ensure-ConsoleSpace {
+    param(
+        [int]$LinesNeeded
+    )
+    $bufferHeight = 100
+    try { $bufferHeight = [Console]::BufferHeight } catch {}
+    
+    $currentTop = [Console]::CursorTop
+    $linesToBottom = ($bufferHeight - 1) - $currentTop
+    
+    if ($linesToBottom -lt $LinesNeeded) {
+        for ($i = 0; $i -lt $linesToBottom; $i++) {
+            Write-Host ""
+        }
+        $remainingScroll = $LinesNeeded - $linesToBottom
+        for ($i = 0; $i -lt $remainingScroll; $i++) {
+            Write-Host ""
+        }
+        
+        $startTop = [Console]::CursorTop - $LinesNeeded
+        if ($startTop -lt 0) { $startTop = 0 }
+        return $startTop
+    }
+    
+    return $currentTop
+}
+
+function Get-EnvKeysForProvider {
+    param(
+        [string]$ProviderKeyName
+    )
+    $envVars = Import-ClaudeDotEnv
+    $keys = @()
+    foreach ($keyName in $envVars.Keys) {
+        if ($keyName -eq $ProviderKeyName -or $keyName -like "${ProviderKeyName}_*") {
+            $keys += $keyName
+        }
+    }
+    return @($keys | Sort-Object)
+}
+
+function Get-ProfilesUsingKey {
+    param([string]$KeyName)
+    $profiles = @(Get-ProfileEntries)
+    $usedBy = @()
+    foreach ($profile in $profiles) {
+        $tpl = Load-ProfileTemplate $profile.Path
+        if ($tpl.ApiKeyId -eq $KeyName -or $tpl.ApiKeyName -eq $KeyName) {
+            $usedBy += $profile.Name
+        }
+    }
+    return $usedBy
+}
+
+function Get-ConfiguredApiKeys {
+    $envVars = Import-ClaudeDotEnv
+    $providers = Get-ProviderRegistry
+    
+    $results = @()
+    foreach ($keyName in @($envVars.Keys | Sort-Object)) {
+        $matchedProvider = $null
+        $matchedPrefix = ""
+        foreach ($p in $providers) {
+            $prefix = $p.KeyName
+            if ($keyName -eq $prefix -or $keyName -like "${prefix}_*") {
+                if ($prefix.Length -gt $matchedPrefix.Length) {
+                    $matchedPrefix = $prefix
+                    $matchedProvider = $p
+                }
+            }
+        }
+        
+        if ($matchedProvider) {
+            $suffix = ""
+            if ($keyName -like "${matchedPrefix}_*") {
+                $suffix = $keyName.Substring($matchedPrefix.Length + 1)
+            }
+            
+            $results += [pscustomobject]@{
+                KeyName = $keyName
+                ProviderId = $matchedProvider.Id
+                ProviderName = $matchedProvider.Name
+                Suffix = $suffix
+                Value = $envVars[$keyName]
+            }
+        }
+    }
+    return $results
+}
+
+function Test-ClaudeWindows {
+    try {
+        return [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
+    } catch {
+        return ($env:OS -match "Windows")
+    }
+}
+
+function Get-ClaudeHomeDir {
+    $homeDir = [Environment]::GetFolderPath("UserProfile")
+    if (![string]::IsNullOrWhiteSpace($homeDir)) { return $homeDir }
+    if (![string]::IsNullOrWhiteSpace($env:HOME)) { return $env:HOME }
+    if (![string]::IsNullOrWhiteSpace($env:USERPROFILE)) { return $env:USERPROFILE }
+    return (Get-Location).Path
+}
+
+function Get-ClaudeExecutablePath {
+    if (![string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_BIN) -and (Test-Path -LiteralPath $env:CLAUDE_CODE_BIN)) {
+        return $env:CLAUDE_CODE_BIN
+    }
+
+    $homeDir = Get-ClaudeHomeDir
+    $candidates = @(
+        (Join-Path $homeDir ".local/bin/claude.exe"),
+        (Join-Path $homeDir ".local/bin/claude")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+
+    $command = Get-Command claude -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    return $null
+}
+
+function Get-ClaudeSettingsPath {
+    $homeDir = Get-ClaudeHomeDir
+    return (Join-Path (Join-Path $homeDir ".claude") "settings.json")
+}
+
+function Backup-ClaudeSettingsFile {
+    param([string]$Path)
+
+    if (!(Test-Path -LiteralPath $Path)) { return "" }
+    $backup = "$Path.bak-$(Get-Date -Format yyyyMMddHHmmss)"
+    Copy-Item -LiteralPath $Path -Destination $backup -Force
+    return $backup
+}
+
+function Remove-ClaudeJsonProperty {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) { return $false }
+    $prop = $Object.PSObject.Properties[$Name]
+    if (!$prop) { return $false }
+    [void]$Object.PSObject.Properties.Remove($Name)
+    return $true
+}
+
+function Write-ClaudeSettingsJson {
+    param(
+        [string]$Path,
+        [object]$Settings
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (![string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    $json = $Settings | ConvertTo-Json -Depth 50
+    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+}
+
+function Repair-ClaudeSettings {
+    param(
+        [string]$SettingsPath = "",
+        [switch]$Quiet
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SettingsPath)) {
+        $SettingsPath = Get-ClaudeSettingsPath
+    }
+    if (!(Test-Path -LiteralPath $SettingsPath)) {
+        if (!$Quiet) { Write-Host "Claude settings.json: not found; nothing to repair." -ForegroundColor DarkGray }
+        return $false
+    }
+
+    $settings = $null
+    try {
+        $raw = Get-Content -LiteralPath $SettingsPath -Raw
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            $settings = [pscustomobject]@{}
+        } else {
+            $settings = $raw | ConvertFrom-Json
+        }
+    } catch {
+        $backup = Backup-ClaudeSettingsFile -Path $SettingsPath
+        Write-ClaudeSettingsJson -Path $SettingsPath -Settings ([pscustomobject]@{})
+        if (!$Quiet) {
+            Write-Host "Claude settings.json was invalid JSON and was reset to {}." -ForegroundColor Yellow
+            if ($backup) { Write-Host "Backup: $backup" -ForegroundColor DarkGray }
+        }
+        return $true
+    }
+
+    if ($null -eq $settings) { $settings = [pscustomobject]@{} }
+    $changed = $false
+    $managedEnvKeys = @(
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    )
+
+    $envProp = $settings.PSObject.Properties["env"]
+    if ($envProp) {
+        $envSettings = $envProp.Value
+        $isObject = ($envSettings -is [pscustomobject]) -or ($envSettings -is [hashtable])
+        if ($isObject) {
+            foreach ($key in $managedEnvKeys) {
+                if (Remove-ClaudeJsonProperty -Object $envSettings -Name $key) {
+                    $changed = $true
+                }
+            }
+            if (@($envSettings.PSObject.Properties).Count -eq 0) {
+                if (Remove-ClaudeJsonProperty -Object $settings -Name "env") {
+                    $changed = $true
+                }
+            }
+        } else {
+            if (Remove-ClaudeJsonProperty -Object $settings -Name "env") {
+                $changed = $true
+            }
+        }
+    }
+
+    if (Remove-ClaudeJsonProperty -Object $settings -Name "model") {
+        $changed = $true
+    }
+
+    if (!$changed) {
+        if (!$Quiet) { Write-Host "Claude settings.json: no cc-manage auth/model conflicts found." -ForegroundColor Green }
+        return $false
+    }
+
+    $backupPath = Backup-ClaudeSettingsFile -Path $SettingsPath
+    Write-ClaudeSettingsJson -Path $SettingsPath -Settings $settings
+    if (!$Quiet) {
+        Write-Host "Claude settings.json repaired: removed managed Anthropic auth/base/model overrides." -ForegroundColor Green
+        if ($backupPath) { Write-Host "Backup: $backupPath" -ForegroundColor DarkGray }
+    }
+    return $true
+}
+
+function Get-NodeExecutablePath {
+    if (![string]::IsNullOrWhiteSpace($env:NODE_EXE) -and (Test-Path -LiteralPath $env:NODE_EXE)) {
+        return $env:NODE_EXE
+    }
+    $command = Get-Command node -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    return "node"
+}
+
+function Test-LocalPortListening {
+    param([int]$Port)
+    $client = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (!$async.AsyncWaitHandle.WaitOne(300)) { return $false }
+        $client.EndConnect($async)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+}
+
+function Get-LocalPortOwnerBestEffort {
+    param([int]$Port)
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($listener) { return $listener.OwningProcess }
+    }
+    return $null
+}
+
+function Start-ClaudeProxyProcess {
+    param([string]$ProxyScript, [int]$ProxyPort)
+    $params = @{
+        FilePath = Get-NodeExecutablePath
+        ArgumentList = @("`"$ProxyScript`"", "$ProxyPort")
+        PassThru = $true
+    }
+    if (Test-ClaudeWindows) { $params.WindowStyle = "Hidden" }
+    return Start-Process @params
+}
+
+function Get-ActiveProfile {
+    $file = Join-Path $PSScriptRoot ".claude_active_profile"
+    if (!(Test-Path $file)) { return $null }
+    $lines = Get-Content $file
+    $result = @{}
+    foreach ($line in $lines) {
+        $line = $line.Trim()
+        if ($line -match "^(PROFILE|MODEL)=(.*)") {
+            $result[$matches[1]] = $matches[2]
+        }
+    }
+    return $result
+}
+
+function Set-ActiveProfile {
+    param([string]$ProfileName, [string]$Model)
+    $file = Join-Path $PSScriptRoot ".claude_active_profile"
+    Set-Content -Path $file -Value "PROFILE=$ProfileName`nMODEL=$Model" -NoNewline
+}
+
+function Get-ProfileScript {
+    param([string]$Name)
+    $path = Join-Path $PROFILES_DIR "$Name.ps1"
+    if (Test-Path $path) { return $path }
+    return $null
+}
+
+function Test-Number {
+    param([string]$Value)
+    return $Value -match "^\d+$"
+}
+
+function Test-InteractiveConsole {
+    try {
+        return (-not [Console]::IsInputRedirected) -and (-not [Console]::IsOutputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Get-MenuItemLabel {
+    param($Item)
+    if ($null -eq $Item) { return "" }
+    if ($Item.PSObject.Properties["Label"]) { return [string]$Item.Label }
+    return [string]$Item
+}
+
+function Get-MenuItemValue {
+    param($Item)
+    if ($null -eq $Item) { return $null }
+    if ($Item.PSObject.Properties["Value"]) { return $Item.Value }
+    return $Item
+}
+
+function Write-MenuLine {
+    param(
+        [string]$Text,
+        [switch]$Selected
+    )
+
+    $width = 100
+    try { $width = [Math]::Max(20, [Console]::WindowWidth - 1) } catch {}
+    if ($Text.Length -gt $width) {
+        $Text = $Text.Substring(0, $width - 3) + "..."
+    }
+    $line = $Text.PadRight($width)
+
+    if ($Selected) {
+        Write-Host $line -ForegroundColor Black -BackgroundColor Cyan
+    } else {
+        Write-Host $line -ForegroundColor Gray
+    }
+}
+
+function Clear-ConsoleBlock {
+    param(
+        [int]$StartRow,
+        [int]$LineCount = 60
+    )
+
+    try {
+        $width = [Math]::Max(1, [Console]::WindowWidth - 1)
+        $bufferHeight = [Console]::BufferHeight
+        $safeStart = [Math]::Min($bufferHeight - 1, [Math]::Max(0, $StartRow))
+        $endRow = [Math]::Min($bufferHeight - 1, $safeStart + $LineCount)
+        for ($row = $safeStart; $row -lt $endRow; $row++) {
+            Set-SafeCursorPosition 0 $row
+            [Console]::Write((" " * $width))
+        }
+        Set-SafeCursorPosition 0 $safeStart
+    } catch {}
+}
+
+function Read-MenuSelection {
+    param(
+        [string]$Title,
+        [object[]]$Items,
+        [int]$DefaultIndex = 0,
+        [string]$Prompt = "Use Up/Down arrows, Enter to select, Esc to cancel. You can also press a number."
+    )
+
+    $itemsArray = @($Items)
+    if ($itemsArray.Count -eq 0) { return $null }
+
+    if ($DefaultIndex -lt 0 -or $DefaultIndex -ge $itemsArray.Count) { $DefaultIndex = 0 }
+
+    if (!(Test-InteractiveConsole)) {
+        if (![string]::IsNullOrWhiteSpace($Title)) { Write-Host $Title -ForegroundColor Yellow }
+        for ($i = 0; $i -lt $itemsArray.Count; $i++) {
+            Write-Host ("  {0,2}. {1}" -f ($i + 1), (Get-MenuItemLabel $itemsArray[$i])) -ForegroundColor Green
+        }
+        $selection = Read-Host "Select number"
+        if (!($selection -match '^\d+$')) { return $null }
+        $index = [int]$selection - 1
+        if ($index -lt 0 -or $index -ge $itemsArray.Count) { return $null }
+        return (Get-MenuItemValue $itemsArray[$index])
+    }
+
+    if (![string]::IsNullOrWhiteSpace($Title)) { Write-Host "`n$Title" -ForegroundColor Yellow }
+    if (![string]::IsNullOrWhiteSpace($Prompt)) { Write-Host $Prompt -ForegroundColor DarkGray }
+
+    $selected = $DefaultIndex
+    $menuTop = Ensure-ConsoleSpace $itemsArray.Count
+
+    while ($true) {
+        Set-SafeCursorPosition 0 $menuTop
+        $beforeDraw = [Console]::CursorTop
+        for ($i = 0; $i -lt $itemsArray.Count; $i++) {
+            $prefix = if ($i -eq $selected) { ">" } else { " " }
+            $label = Get-MenuItemLabel $itemsArray[$i]
+            Write-MenuLine -Text ("{0} {1,2}. {2}" -f $prefix, ($i + 1), $label) -Selected:($i -eq $selected)
+        }
+        $afterDraw = [Console]::CursorTop
+        
+        $expectedAfter = $beforeDraw + $itemsArray.Count
+        if ($expectedAfter -gt $afterDraw) {
+            $scrolledAmount = $expectedAfter - $afterDraw
+            $menuTop = [Math]::Max(0, $menuTop - $scrolledAmount)
+        }
+
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            ([ConsoleKey]::UpArrow) {
+                $selected = ($selected - 1 + $itemsArray.Count) % $itemsArray.Count
+                continue
+            }
+            ([ConsoleKey]::DownArrow) {
+                $selected = ($selected + 1) % $itemsArray.Count
+                continue
+            }
+            ([ConsoleKey]::Enter) {
+                Set-SafeCursorPosition 0 ($menuTop + $itemsArray.Count) -ScrollIfBeyond
+                return (Get-MenuItemValue $itemsArray[$selected])
+            }
+            ([ConsoleKey]::Escape) {
+                Set-SafeCursorPosition 0 ($menuTop + $itemsArray.Count) -ScrollIfBeyond
+                return $null
+            }
+        }
+
+        if ($key.KeyChar -match '^[1-9]$') {
+            $index = [int]([string]$key.KeyChar) - 1
+            if ($index -ge 0 -and $index -lt $itemsArray.Count) {
+                Set-SafeCursorPosition 0 ($menuTop + $itemsArray.Count) -ScrollIfBeyond
+                return (Get-MenuItemValue $itemsArray[$index])
+            }
+        }
+    }
+}
+
+function Ensure-ProfilesDirectory {
+    if (!(Test-Path -LiteralPath $script:PROFILES_DIR)) {
+        New-Item -ItemType Directory -Force -Path $script:PROFILES_DIR | Out-Null
+    }
+}
+
+function Get-ProfileEntries {
+    Ensure-ProfilesDirectory
+    $index = 0
+    Get-ChildItem -LiteralPath $PROFILES_DIR -Filter "*.ps1" | Sort-Object BaseName | ForEach-Object {
+        $index++
+        . $_.FullName
+        [pscustomobject]@{
+            Index = $index
+            Name = $_.BaseName
+            DisplayName = if ($script:PROFILE_NAME) { $script:PROFILE_NAME } else { $_.BaseName }
+            Path = $_.FullName
+            BaseUrl = $script:BASE_URL
+            DefaultModel = $script:DEFAULT_MODEL
+            Models = @($script:MODELS)
+        }
+    }
+}
+
+function Show-ProfileMenu {
+    param($Entries)
+    Write-Host "Usage: cc-switch [profile-number|profile-name] [model-number|model-name]" -ForegroundColor Cyan
+    Write-Host ""
+
+    if (!$Entries -or @($Entries).Count -eq 0) {
+        Write-Host "No profiles are configured yet." -ForegroundColor Yellow
+        Write-Host "Run 'cc-manage add' to create your first profile." -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host "Available profiles:" -ForegroundColor Yellow
+    foreach ($entry in $Entries) {
+        Write-Host ("  {0,2}. {1}" -f $entry.Index, $entry.Name) -ForegroundColor Green
+        Write-Host "      Default: $($entry.DefaultModel)" -ForegroundColor DarkGray
+        Write-Host "      Models:  $($entry.Models -join ', ')" -ForegroundColor DarkGray
+    }
+}
+
+function Resolve-ProfileEntry {
+    param(
+        [string]$Selection,
+        [switch]$Prompt
+    )
+
+    $entries = @(Get-ProfileEntries)
+    if ($entries.Count -eq 0) {
+        Show-ProfileMenu $entries
+        return $null
+    }
+
+    if ($Prompt -or [string]::IsNullOrWhiteSpace($Selection)) {
+        $items = @($entries | ForEach-Object {
+            [pscustomobject]@{
+                Label = ("{0}  [{1}]" -f $_.Name, $_.DefaultModel)
+                Value = $_
+            }
+        })
+        return (Read-MenuSelection -Title "Available profiles" -Items $items)
+    }
+
+    if (Test-Number $Selection) {
+        $profileNumber = [int]$Selection
+        $entry = $entries | Where-Object { $_.Index -eq $profileNumber } | Select-Object -First 1
+        if ($entry) { return $entry }
+
+        Write-Host "Error: Profile number '$Selection' not found" -ForegroundColor Red
+        Show-ProfileMenu $entries
+        return $null
+    }
+
+    $entry = $entries | Where-Object {
+        $_.Name -eq $Selection -or $_.DisplayName -eq $Selection
+    } | Select-Object -First 1
+
+    if ($entry) { return $entry }
+
+    Write-Host "Error: Profile '$Selection' not found" -ForegroundColor Red
+    Show-ProfileMenu $entries
+    return $null
+}
+
+function Show-ModelMenu {
+    param($ProfileEntry)
+    Write-Host "Available models for $($ProfileEntry.Name):" -ForegroundColor Yellow
+    for ($i = 0; $i -lt $ProfileEntry.Models.Count; $i++) {
+        $number = $i + 1
+        $suffix = if ($ProfileEntry.Models[$i] -eq $ProfileEntry.DefaultModel) { " (default)" } else { "" }
+        Write-Host ("  {0,2}. {1}{2}" -f $number, $ProfileEntry.Models[$i], $suffix) -ForegroundColor Green
+    }
+}
+
+function Resolve-ModelName {
+    param(
+        $ProfileEntry,
+        [string]$Selection,
+        [switch]$Prompt
+    )
+
+    if ($Prompt -and $ProfileEntry.Models.Count -gt 1 -and [string]::IsNullOrWhiteSpace($Selection)) {
+        $defaultIndex = [array]::IndexOf(@($ProfileEntry.Models), $ProfileEntry.DefaultModel)
+        if ($defaultIndex -lt 0) { $defaultIndex = 0 }
+        $items = @()
+        foreach ($modelName in @($ProfileEntry.Models)) {
+            $suffix = if ($modelName -eq $ProfileEntry.DefaultModel) { " (default)" } else { "" }
+            $items += [pscustomobject]@{
+                Label = "$modelName$suffix"
+                Value = $modelName
+            }
+        }
+        return (Read-MenuSelection -Title "Available models for $($ProfileEntry.Name)" -Items $items -DefaultIndex $defaultIndex)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Selection)) {
+        return $ProfileEntry.DefaultModel
+    }
+
+    if (Test-Number $Selection) {
+        $modelNumber = [int]$Selection
+        if ($modelNumber -ge 1 -and $modelNumber -le $ProfileEntry.Models.Count) {
+            return $ProfileEntry.Models[$modelNumber - 1]
+        }
+
+        Write-Host "Error: Model number '$Selection' not found in profile '$($ProfileEntry.Name)'" -ForegroundColor Red
+        Show-ModelMenu $ProfileEntry
+        return $null
+    }
+
+    if ($ProfileEntry.Models -contains $Selection) {
+        return $Selection
+    }
+
+    Write-Host "Error: Model '$Selection' not found in profile '$($ProfileEntry.Name)'" -ForegroundColor Red
+    Show-ModelMenu $ProfileEntry
+    return $null
+}
+
+function Get-ClaudeModelAliases {
+    param([string]$SelectedModel)
+    $models = @($script:MODELS)
+    $fallbacks = @($models | Where-Object { $_ -ne $SelectedModel })
+
+    return [pscustomobject]@{
+        Sonnet = $SelectedModel
+        Opus = if ($fallbacks.Count -ge 1) { $fallbacks[0] } else { $SelectedModel }
+        Haiku = if ($fallbacks.Count -ge 2) { $fallbacks[1] } else { $SelectedModel }
+    }
+}
+
+function cc-switch {
+    param(
+        [string]$ProfileName,
+        [string]$Model = ""
+    )
+
+    $promptForProfile = [string]::IsNullOrWhiteSpace($ProfileName)
+    $entry = Resolve-ProfileEntry $ProfileName -Prompt:$promptForProfile
+    if (!$entry) { return }
+
+    $modelName = Resolve-ModelName $entry $Model -Prompt:$promptForProfile
+    if (!$modelName) { return }
+
+    Set-ActiveProfile $entry.Name $modelName
+    Write-Host "Switched to profile: $($entry.DisplayName) -> $modelName" -ForegroundColor Green
+}
+
+function ccs {
+    param(
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$CcArgs
+    )
+
+    $active = Get-ActiveProfile
+    if (!$active) {
+        Write-Host "No active profile found. Use 'cc-switch <profile>' first." -ForegroundColor Red
+        return
+    }
+
+    $profilePath = Get-ProfileScript $active["PROFILE"]
+    if (!$profilePath) {
+        Write-Host "Error: Profile script not found for '$($active['PROFILE'])'" -ForegroundColor Red
+        return
+    }
+
+    . $profilePath
+
+    $profileEntry = [pscustomobject]@{
+        Name = $active["PROFILE"]
+        DisplayName = if ($script:PROFILE_NAME) { $script:PROFILE_NAME } else { $active["PROFILE"] }
+        Path = $profilePath
+        BaseUrl = $script:BASE_URL
+        DefaultModel = $script:DEFAULT_MODEL
+        Models = @($script:MODELS)
+    }
+
+    $model = $active["MODEL"]
+    $claudeArgs = @()
+    if ($CcArgs -and $CcArgs.Count -gt 0) {
+        $firstArg = $CcArgs[0]
+
+        $modelOverride = $null
+        if (Test-Number $firstArg) {
+            $modelOverride = Resolve-ModelName $profileEntry $firstArg
+        } elseif ($script:MODELS -contains $firstArg) {
+            $modelOverride = $firstArg
+        }
+
+        if ($modelOverride) {
+            $model = $modelOverride
+            if ($CcArgs.Count -gt 1) {
+                $claudeArgs = $CcArgs[1..($CcArgs.Count - 1)]
+            }
+        } elseif (Test-Number $firstArg) {
+            return
+        } else {
+            $claudeArgs = $CcArgs
+        }
+    }
+
+    if ($script:MODELS -contains $model) {
+        try {
+            $resolvedApiKey = Get-ProfileApiKey
+        } catch {
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+            return
+        }
+
+        Repair-ClaudeSettings -Quiet | Out-Null
+
+        $env:CC_PROVIDER = $script:PROVIDER
+        $env:CC_PROVIDER_MODE = $script:MODE
+        $env:CC_PROFILE_BASE_URL = $script:BASE_URL
+        $env:CC_UPSTREAM_BASE_URL = if ($script:UPSTREAM_BASE_URL) { $script:UPSTREAM_BASE_URL } else { $script:BASE_URL }
+        $env:CC_DEFAULT_MODEL = $script:DEFAULT_MODEL
+        $env:CC_MODELS = (@($script:MODELS) -join ",")
+
+        $proxyProcess = $null
+        $proxyScript = $null
+        if ($script:PROXY_SCRIPT) {
+            $resolvedProxyScript = Resolve-Path -LiteralPath $script:PROXY_SCRIPT -ErrorAction SilentlyContinue
+            if ($resolvedProxyScript) {
+                $proxyScript = $resolvedProxyScript.Path
+            }
+        }
+        if ($proxyScript) {
+            $proxyPort = if ($script:PROXY_PORT) { $script:PROXY_PORT } else { 18000 }
+            $portInUse = Test-LocalPortListening -Port $proxyPort
+            if (-not $portInUse) {
+                Write-Host "  Starting proxy: $(Split-Path $proxyScript -Leaf) on :$proxyPort" -ForegroundColor DarkGray
+                $proxyProcess = Start-ClaudeProxyProcess -ProxyScript $proxyScript -ProxyPort $proxyPort
+                $proxyReady = $false
+                for ($retry = 0; $retry -lt 20; $retry++) {
+                    Start-Sleep -Milliseconds 100
+                    if (Test-LocalPortListening -Port $proxyPort) { $proxyReady = $true; break }
+                    if ($proxyProcess -and $proxyProcess.HasExited) { break }
+                }
+                if (-not $proxyReady) {
+                    Write-Host "  Warning: proxy may not be ready on :$proxyPort" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  Using existing proxy on :$proxyPort" -ForegroundColor DarkGray
+                $ownerPid = Get-LocalPortOwnerBestEffort -Port $proxyPort
+                if ($ownerPid) { Write-Host "  Proxy PID: $ownerPid" -ForegroundColor DarkGray }
+                # Check if another profile also claims this port
+                $portClaimants = @()
+                Get-ChildItem -Path $script:PROFILES_DIR -Filter "*.ps1" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    $pc = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                    if ($pc -match "(?mi)^\`$script:PROXY_PORT\s*=\s*$([regex]::Escape("$proxyPort"))" -and $_.BaseName -ne $active["PROFILE"]) {
+                        $portClaimants += $_.BaseName
+                    }
+                }
+                if ($portClaimants.Count -gt 0) {
+                    Write-Host "  WARNING: Port $proxyPort is also claimed by: $($portClaimants -join ', '). This may be the wrong proxy." -ForegroundColor Yellow
+                }
+            }
+        } elseif ($script:PROXY_SCRIPT) {
+            Write-Host "  Proxy script not found: $($script:PROXY_SCRIPT)" -ForegroundColor Yellow
+        }
+
+        $env:ANTHROPIC_BASE_URL = $script:BASE_URL
+        $env:ANTHROPIC_MODEL = $model
+        $modelAliases = Get-ClaudeModelAliases $model
+        $env:ANTHROPIC_DEFAULT_SONNET_MODEL = $modelAliases.Sonnet
+        $env:ANTHROPIC_DEFAULT_OPUS_MODEL = $modelAliases.Opus
+        $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = $modelAliases.Haiku
+
+        Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+
+        if ($script:AUTH_MODE -eq "auth_token") {
+            $env:ANTHROPIC_AUTH_TOKEN = $resolvedApiKey
+        } else {
+            $env:ANTHROPIC_API_KEY = $resolvedApiKey
+        }
+
+        Write-Host "Launching Claude with profile: $($script:PROFILE_NAME) -> $model" -ForegroundColor Cyan
+        Write-Host "  Base URL: $($script:BASE_URL)" -ForegroundColor DarkGray
+        Write-Host "  /model aliases: sonnet=$($modelAliases.Sonnet), opus=$($modelAliases.Opus), haiku=$($modelAliases.Haiku)" -ForegroundColor DarkGray
+
+        $claudeExe = Get-ClaudeExecutablePath
+        if (!$claudeExe) {
+            Write-Host "Error: Claude Code executable not found. Set CLAUDE_CODE_BIN or install the 'claude' command." -ForegroundColor Red
+            $global:LASTEXITCODE = 1
+        } else {
+            & $claudeExe @claudeArgs
+        }
+
+        if ($proxyProcess -and !$proxyProcess.HasExited) {
+            $proxyProcess.Kill()
+            Write-Host "  Proxy stopped" -ForegroundColor DarkGray
+        }
+
+        Remove-Item Env:\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_AUTH_TOKEN -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_MODEL -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_DEFAULT_SONNET_MODEL -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_DEFAULT_OPUS_MODEL -ErrorAction SilentlyContinue
+        Remove-Item Env:\ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_PROVIDER -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_PROVIDER_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_PROFILE_BASE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_UPSTREAM_BASE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_DEFAULT_MODEL -ErrorAction SilentlyContinue
+        Remove-Item Env:\CC_MODELS -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "Error: Model '$model' not found in profile '$($active['PROFILE'])'" -ForegroundColor Red
+        Write-Host "Available models:" -ForegroundColor Yellow
+        $script:MODELS | ForEach-Object { Write-Host "  - $_" }
+    }
+}
+
+function cc-status {
+    $active = Get-ActiveProfile
+    if (!$active) {
+        Write-Host "No active profile set." -ForegroundColor Yellow
+        Write-Host "Use 'cc-switch <profile>' to set one." -ForegroundColor Yellow
+        return
+    }
+
+    $profilePath = Get-ProfileScript $active["PROFILE"]
+    $profileName = $active["PROFILE"]
+    $model = $active["MODEL"]
+
+    if ($profilePath) {
+        . $profilePath
+        $displayName = $script:PROFILE_NAME
+        $baseUrl = $script:BASE_URL
+        $provider = $script:PROVIDER
+        $mode = $script:MODE
+        $keyId = $script:API_KEY_ID
+        $keyName = if ($script:API_KEY_ID) { $script:API_KEY_ID } else { $script:API_KEY_NAME }
+    } else {
+        $displayName = $profileName
+        $baseUrl = "?"
+        $provider = "?"
+        $mode = "?"
+        $keyId = "?"
+        $keyName = "?"
+    }
+
+    Write-Host "Active profile: $displayName -> $model" -ForegroundColor Green
+    Write-Host "  Base URL: $baseUrl" -ForegroundColor DarkGray
+    if ($provider) { Write-Host "  Provider: $provider ($mode)" -ForegroundColor DarkGray }
+    if ($keyName) { Write-Host "  API Key ID: $keyName" -ForegroundColor DarkGray }
+}
+
+function Start-ProfileManager {
+    while ($true) {
+        $choice = Read-MenuSelection -Title "--- Profile Management ($PROFILES_DIR) ---" -Items @(
+            [pscustomobject]@{ Label = "List Profiles"; Value = "1" }
+            [pscustomobject]@{ Label = "Add New Profile"; Value = "2" }
+            [pscustomobject]@{ Label = "Edit Existing Profile"; Value = "3" }
+            [pscustomobject]@{ Label = "Delete Profile"; Value = "4" }
+            [pscustomobject]@{ Label = "Manage API Keys"; Value = "5" }
+            [pscustomobject]@{ Label = "Exit Management"; Value = "6" }
+        )
+        if (!$choice) { return }
+        
+        switch ($choice) {
+            "1" { 
+                Show-ProfileMenu (Get-ProfileEntries)
+                Read-Host "Press Enter to continue" 
+            }
+            "2" { Add-ProfileInteractive }
+            "3" { Edit-ProfileInteractive }
+            "4" { Delete-ProfileInteractive }
+            "5" { Start-KeyManager }
+            "6" { return }
+        }
+    }
+}
+
+function Start-KeyManager {
+    while ($true) {
+        $choice = Read-MenuSelection -Title "--- Key Management ---" -Items @(
+            [pscustomobject]@{ Label = "List API Keys"; Value = "1" }
+            [pscustomobject]@{ Label = "Add API Key"; Value = "2" }
+            [pscustomobject]@{ Label = "Edit API Key"; Value = "3" }
+            [pscustomobject]@{ Label = "Delete API Key"; Value = "4" }
+            [pscustomobject]@{ Label = "Back to Main Menu"; Value = "5" }
+        )
+        if (!$choice) { return }
+        
+        switch ($choice) {
+            "1" {
+                Show-ApiKeysList
+                Read-Host "Press Enter to continue"
+            }
+            "2" { Add-ApiKeyInteractive }
+            "3" { Edit-ApiKeyInteractive }
+            "4" { Delete-ApiKeyInteractive }
+            "5" { return }
+        }
+    }
+}
+
+function Show-ApiKeysList {
+    Write-Host "`n--- Configured API Keys ---" -ForegroundColor Yellow
+    $keys = @(Get-ConfiguredApiKeys)
+    if ($keys.Count -eq 0) {
+        Write-Host "No API keys configured yet." -ForegroundColor DarkGray
+        return
+    }
+    
+    foreach ($k in $keys) {
+        $usedBy = @(Get-ProfilesUsingKey $k.KeyName)
+        $usedText = if ($usedBy.Count -gt 0) { "Used by: $($usedBy -join ', ')" } else { "Not used by any profiles" }
+        Write-Host ("- {0} (Provider: {1}, Suffix: {2})" -f $k.KeyName, $k.ProviderName, (if ($k.Suffix) { $k.Suffix } else { "(default)" })) -ForegroundColor Green
+        Write-Host "  Value:   $(Protect-ClaudeSecret $k.Value)" -ForegroundColor Gray
+        Write-Host "  Usage:   $usedText" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+}
+
+function Add-ApiKeyInteractive {
+    Write-Host "`n--- Add API Key ---" -ForegroundColor Cyan
+    $provider = Select-ProviderInteractive
+    if (!$provider) { return }
+    
+    $prefix = $provider.KeyName
+    Write-Host "Prefix for this provider: $prefix" -ForegroundColor DarkGray
+    
+    $suffix = Read-Host "Enter key suffix/name (e.g. vikas)"
+    if ([string]::IsNullOrWhiteSpace($suffix)) {
+        $confirmDefault = Read-Host "No suffix entered. Use the default key name '$prefix'? (y/N)"
+        if ($confirmDefault -notmatch "^y") { return }
+        $suffix = ""
+    }
+    
+    $suffixClean = ConvertTo-ClaudeEnvName $suffix
+    $fullKeyName = if ([string]::IsNullOrWhiteSpace($suffixClean)) { $prefix } else { "${prefix}_${suffixClean}" }
+    
+    $existing = Get-ClaudeEnvValue $fullKeyName
+    if (![string]::IsNullOrEmpty($existing)) {
+        Write-Host "Error: API key name '$fullKeyName' already exists in .env!" -ForegroundColor Red
+        $editInstead = Read-Host "Would you like to edit it instead? (y/N)"
+        if ($editInstead -match "^y") {
+            Edit-ApiKeyInteractive -PreselectedKeyName $fullKeyName
+        }
+        return
+    }
+    
+    $secure = Read-Host "Enter API key value for $fullKeyName" -AsSecureString
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+    if ([string]::IsNullOrWhiteSpace($plain)) {
+        Write-Host "Cancelled (empty key value)." -ForegroundColor Yellow
+        return
+    }
+    
+    Set-ClaudeEnvValue -Name $fullKeyName -Value $plain
+    Write-Host "Saved $fullKeyName to .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+    Read-Host "Press Enter to continue"
+}
+
+function Edit-ApiKeyInteractive {
+    param([string]$PreselectedKeyName = "")
+    
+    Write-Host "`n--- Edit API Key ---" -ForegroundColor Cyan
+    $keyName = $PreselectedKeyName
+    
+    if ([string]::IsNullOrWhiteSpace($keyName)) {
+        $keys = @(Get-ConfiguredApiKeys)
+        if ($keys.Count -eq 0) {
+            Write-Host "No API keys configured yet." -ForegroundColor Yellow
+            Read-Host "Press Enter to continue"
+            return
+        }
+        
+        $items = @($keys | ForEach-Object {
+            [pscustomobject]@{
+                Label = ("{0} ({1})" -f $_.KeyName, $_.ProviderName)
+                Value = $_.KeyName
+            }
+        })
+        
+        $keyName = Read-MenuSelection -Title "Select key to edit" -Items $items
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($keyName)) { return }
+    
+    Write-Host "Editing: $keyName" -ForegroundColor Yellow
+    $usedBy = @(Get-ProfilesUsingKey $keyName)
+    if ($usedBy.Count -gt 0) {
+        Write-Host "Profiles using this key: $($usedBy -join ', ')" -ForegroundColor Yellow
+    } else {
+        Write-Host "This key is not used by any profiles." -ForegroundColor DarkGray
+    }
+    
+    $secure = Read-Host "Enter new API key value (leave blank to keep current)" -AsSecureString
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+    if (![string]::IsNullOrWhiteSpace($plain)) {
+        Set-ClaudeEnvValue -Name $keyName -Value $plain
+        Write-Host "Updated $keyName in .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+    } else {
+        Write-Host "Key value unchanged." -ForegroundColor Yellow
+    }
+    Read-Host "Press Enter to continue"
+}
+
+function Delete-ApiKeyInteractive {
+    Write-Host "`n--- Delete API Key ---" -ForegroundColor Cyan
+    $keys = @(Get-ConfiguredApiKeys)
+    if ($keys.Count -eq 0) {
+        Write-Host "No API keys configured yet." -ForegroundColor Yellow
+        Read-Host "Press Enter to continue"
+        return
+    }
+    
+    $items = @($keys | ForEach-Object {
+        [pscustomobject]@{
+            Label = ("{0} ({1})" -f $_.KeyName, $_.ProviderName)
+            Value = $_.KeyName
+        }
+    })
+    
+    $keyName = Read-MenuSelection -Title "Select key to delete" -Items $items
+    if ([string]::IsNullOrWhiteSpace($keyName)) { return }
+    
+    $usedBy = @(Get-ProfilesUsingKey $keyName)
+    if ($usedBy.Count -gt 0) {
+        Write-Host "WARNING: This key is currently used by profiles: $($usedBy -join ', ')" -ForegroundColor Red
+        Write-Host "Deleting it will break these profiles unless they are assigned a different key!" -ForegroundColor Red
+    }
+    
+    $confirm = Read-Host "Are you sure you want to delete '$keyName' from .env? (y/N)"
+    if ($confirm -match "^y") {
+        Remove-ClaudeEnvValue -Name $keyName
+        Write-Host "Removed $keyName from .env." -ForegroundColor Green
+    } else {
+        Write-Host "Deletion cancelled." -ForegroundColor Yellow
+    }
+    Read-Host "Press Enter to continue"
+}
+
+function Load-ProfileTemplate {
+    param($Path)
+    $content = Get-Content $Path -Raw
+    $profile = @{
+        Name = ""; BaseUrl = ""; AuthMode = "api_key"; ApiKey = "";
+        ApiKeyId = ""; ApiKeyName = ""; Provider = ""; Mode = ""; UpstreamBaseUrl = "";
+        ProxyScript = ""; ProxyPort = ""; DefaultModel = ""; Models = @()
+    }
+    
+    if ($content -match '(?mi)^\$script:PROFILE_VERSION\s*=\s*(\d+)') { $profile.ProfileVersion = $matches[1] }
+    if ($content -match '(?mi)^\$script:PROFILE_NAME\s*=\s*"(.*?)"') { $profile.Name = $matches[1] }
+    if ($content -match '(?mi)^\$script:PROVIDER\s*=\s*"(.*?)"') { $profile.Provider = $matches[1] }
+    if ($content -match '(?mi)^\$script:MODE\s*=\s*"(.*?)"') { $profile.Mode = $matches[1] }
+    if ($content -match '(?mi)^\$script:BASE_URL\s*=\s*"(.*?)"') { $profile.BaseUrl = $matches[1] }
+    if ($content -match '(?mi)^\$script:UPSTREAM_BASE_URL\s*=\s*"(.*?)"') { $profile.UpstreamBaseUrl = $matches[1] }
+    if ($content -match '(?mi)^\$script:AUTH_MODE\s*=\s*"(.*?)"') { $profile.AuthMode = $matches[1] }
+    if ($content -match '(?mi)^\$script:API_KEY\s*=\s*"(.*?)"') { $profile.ApiKey = $matches[1] }
+    if ($content -match '(?mi)^\$script:API_KEY_ID\s*=\s*"(.*?)"') { $profile.ApiKeyId = $matches[1] }
+    if ($content -match '(?mi)^\$script:API_KEY_NAME\s*=\s*"(.*?)"') { $profile.ApiKeyName = $matches[1] }
+    if ($content -match '(?mi)^\$script:PROXY_SCRIPT\s*=\s*(.*?)\r?$') { $profile.ProxyScript = $matches[1] }
+    if ($content -match '(?mi)^\$script:PROXY_PORT\s*=\s*(\d+)') { $profile.ProxyPort = $matches[1] }
+    if ($content -match '(?mi)^\$script:DEFAULT_MODEL\s*=\s*"(.*?)"') { $profile.DefaultModel = $matches[1] }
+    
+    if ($content -match '(?si)\$script:MODELS\s*=\s*@\((.*?)\)') {
+        $modelsBlock = $matches[1]
+        $models = @()
+        $modelsBlock -split "`n" | ForEach-Object {
+            if ($_ -match '"(.*?)"') { $models += $matches[1] }
+        }
+        $profile.Models = $models
+    }
+
+    if ([string]::IsNullOrWhiteSpace($profile.Provider)) {
+        $profile.Provider = Get-ProfileProviderGuess -ProfileName $profile.Name -BaseUrl $profile.BaseUrl -ProxyScript $profile.ProxyScript
+    }
+    if ([string]::IsNullOrWhiteSpace($profile.Mode)) {
+        $profile.Mode = Get-ProfileModeGuess -Provider $profile.Provider -ProxyScript $profile.ProxyScript
+    }
+    if ([string]::IsNullOrWhiteSpace($profile.ApiKeyId) -and ![string]::IsNullOrWhiteSpace($profile.ApiKeyName) -and $profile.ApiKeyName -match '^CCKEY_') {
+        $profile.ApiKeyId = $profile.ApiKeyName
+    }
+    if (![string]::IsNullOrWhiteSpace($profile.ApiKeyId) -and [string]::IsNullOrWhiteSpace($profile.ApiKeyName)) {
+        $profile.ApiKeyName = $profile.ApiKeyId
+    } elseif ([string]::IsNullOrWhiteSpace($profile.ApiKeyName)) {
+        $profile.ApiKeyName = Get-DefaultKeyNameForProvider $profile.Provider
+    }
+
+    return $profile
+}
+
+function Save-ProfileTemplate {
+    param($Path, $profile)
+    $proxyScriptStr = if ($profile.ProxyScript) { "`n`$script:PROXY_SCRIPT = $($profile.ProxyScript)" } else { "" }
+    $proxyPortStr = if ($profile.ProxyPort) { "`n`$script:PROXY_PORT = $($profile.ProxyPort)" } else { "" }
+    $upstreamStr = if ($profile.UpstreamBaseUrl) { "`n`$script:UPSTREAM_BASE_URL = `"$($profile.UpstreamBaseUrl)`"" } else { "" }
+    $modelsStr = ""
+    if ($profile.Models.Count -gt 0) {
+        $quotedModels = $profile.Models | ForEach-Object { "`"$_`"" }
+        $modelsStr = "`n    " + ($quotedModels -join ",`n    ")
+    }
+    
+    $newContent = @"
+`$script:PROFILE_VERSION = 2
+`$script:PROFILE_NAME = "$($profile.Name)"
+`$script:PROVIDER = "$($profile.Provider)"
+`$script:MODE = "$($profile.Mode)"
+`$script:BASE_URL = "$($profile.BaseUrl)"
+`$script:AUTH_MODE = "$($profile.AuthMode)"
+`$script:API_KEY_ID = "$($profile.ApiKeyId)"
+`$script:API_KEY_NAME = "$($profile.ApiKeyName)"$upstreamStr$proxyScriptStr$proxyPortStr
+`$script:DEFAULT_MODEL = "$($profile.DefaultModel)"
+`$script:MODELS = @($modelsStr
+)
+"@
+    Set-Content -Path $Path -Value $newContent -Encoding UTF8
+    Write-Host "Profile saved to $(Split-Path $Path -Leaf)" -ForegroundColor Green
+}
+
+function Get-ExistingProxyEntries {
+    $proxyDir = Join-Path $PSScriptRoot "proxy"
+    if (!(Test-Path $proxyDir)) { return @() }
+
+    $proxyFiles = @(Get-ChildItem -Path $proxyDir -Filter "*.js" -File | Sort-Object Name)
+    $entries = @()
+    $index = 1
+
+    foreach ($proxyFile in $proxyFiles) {
+        $knownPorts = @()
+        if (Test-Path $PROFILES_DIR) {
+            Get-ChildItem -Path $PROFILES_DIR -Filter "*.ps1" -File | ForEach-Object {
+                $content = Get-Content $_.FullName -Raw
+                if ($content -match [regex]::Escape($proxyFile.Name) -and $content -match '(?mi)^\$script:PROXY_PORT\s*=\s*(\d+)') {
+                    $knownPorts += $matches[1]
+                }
+            }
+        }
+
+        $suggestedPort = @($knownPorts | Select-Object -Unique | Sort-Object)[0]
+        $entries += [pscustomobject]@{
+            Index = $index
+            Name = $proxyFile.Name
+            Path = $proxyFile.FullName
+            Expression = "Join-Path `$PSScriptRoot ""..\proxy\$($proxyFile.Name)"""
+            SuggestedPort = $suggestedPort
+        }
+        $index++
+    }
+
+    return $entries
+}
+
+function Select-ExistingProxyInteractive {
+    $proxyEntries = @(Get-ExistingProxyEntries)
+    if ($proxyEntries.Count -eq 0) {
+        Write-Host "No existing proxies found in $(Join-Path $PSScriptRoot "proxy")." -ForegroundColor Yellow
+        return $null
+    }
+
+    $items = @($proxyEntries | ForEach-Object {
+        $portText = if ($_.SuggestedPort) { " [port $($_.SuggestedPort)]" } else { "" }
+        [pscustomobject]@{
+            Label = "$($_.Name)$portText"
+            Value = $_
+        }
+    })
+    return (Read-MenuSelection -Title "Existing proxies" -Items $items)
+}
+
+function Set-ProfileProxyInteractive {
+    param($profile)
+
+    $proxyMode = Read-MenuSelection -Title "Proxy options" -Items @(
+        [pscustomobject]@{ Label = "Pick existing proxy"; Value = "1" }
+        [pscustomobject]@{ Label = "Enter custom proxy path"; Value = "2" }
+    )
+    if ([string]::IsNullOrWhiteSpace($proxyMode)) { return }
+
+    if ($proxyMode -eq "1") {
+        $selectedProxy = Select-ExistingProxyInteractive
+        if (!$selectedProxy) { return }
+        $profile.ProxyScript = $selectedProxy.Expression
+        $defaultPort = if ($selectedProxy.SuggestedPort) { $selectedProxy.SuggestedPort } else { "18000" }
+        $proxyPort = Read-Host "Proxy Port [$defaultPort]"
+        $profile.ProxyPort = if ([string]::IsNullOrWhiteSpace($proxyPort)) { $defaultPort } else { $proxyPort }
+        return
+    }
+
+    if ($proxyMode -eq "2") {
+        $profile.ProxyScript = Read-Host "Proxy script path (e.g. Join-Path `$PSScriptRoot ""..\proxy\..."")"
+        $proxyPort = Read-Host "Proxy Port [18000]"
+        $profile.ProxyPort = if ([string]::IsNullOrWhiteSpace($proxyPort)) { "18000" } else { $proxyPort }
+        return
+    }
+
+    Write-Host "Invalid proxy option. Skipping proxy setup." -ForegroundColor Yellow
+}
+
+function Select-ProviderInteractive {
+    $visible = @(Get-ProviderRegistry | Where-Object { $_.Id -ne "huggingface" -and $_.Id -ne "nvidia" })
+    $items = @($visible | ForEach-Object {
+        [pscustomobject]@{
+            Label = ("{0} ({1}) - {2}" -f $_.Name, $_.Id, $_.Mode)
+            Value = $_
+        }
+    })
+    return (Read-MenuSelection -Title "Select provider" -Items $items)
+}
+
+function Add-ProfileInteractive {
+    Write-Host "`n--- Add New Profile ---" -ForegroundColor Cyan
+    Ensure-ProfilesDirectory
+    $provider = Select-ProviderInteractive
+    if (!$provider) {
+        Write-Host "Invalid provider selection." -ForegroundColor Red
+        Read-Host "Press Enter to continue"
+        return
+    }
+
+    $fileName = Read-Host "Filename (without .ps1, e.g. openrouter-new)"
+    if ([string]::IsNullOrWhiteSpace($fileName)) { return }
+    $Path = Join-Path $PROFILES_DIR "$fileName.ps1"
+    if (Test-Path $Path) {
+        Write-Host "Profile $fileName already exists!" -ForegroundColor Red
+        Read-Host "Press Enter to continue"
+        return
+    }
+
+    $profile = @{
+        Name = ""; BaseUrl = ""; AuthMode = "api_key"; ApiKey = "";
+        ApiKeyId = ""; ApiKeyName = ""; Provider = ""; Mode = ""; UpstreamBaseUrl = "";
+        ProxyScript = ""; ProxyPort = ""; DefaultModel = ""; Models = @()
+    }
+    
+    $profile.Name = Read-Host "Profile Display Name [$fileName]"
+    if ([string]::IsNullOrWhiteSpace($profile.Name)) { $profile.Name = $fileName }
+
+    $profile.Provider = $provider.Id
+    $profile.Mode = $provider.Mode
+    $profile.AuthMode = $provider.AuthMode
+
+    $prefix = $provider.KeyName
+    $existingKeys = @(Get-EnvKeysForProvider -ProviderKeyName $prefix)
+    
+    $selectedKey = ""
+    if ($existingKeys.Count -gt 0) {
+        $keyOptions = @()
+        foreach ($k in $existingKeys) {
+            $keyOptions += [pscustomobject]@{
+                Label = "Use existing key: $k"
+                Value = $k
+            }
+        }
+        $keyOptions += [pscustomobject]@{
+            Label = "Add a new API key"
+            Value = "__ADD_NEW__"
+        }
+        
+        $keyChoice = Read-MenuSelection -Title "API Key Selection for $($provider.Name)" -Items $keyOptions
+        if ($keyChoice -eq "__ADD_NEW__") {
+            $suffix = Read-Host "Enter key suffix/name (e.g. vikas)"
+            $suffixClean = ConvertTo-ClaudeEnvName $suffix
+            $newKeyName = if ([string]::IsNullOrWhiteSpace($suffixClean)) { $prefix } else { "${prefix}_${suffixClean}" }
+            
+            $secure = Read-Host "API key value for $newKeyName" -AsSecureString
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            if (![string]::IsNullOrWhiteSpace($plain)) {
+                Set-ClaudeEnvValue -Name $newKeyName -Value $plain
+                Write-Host "Saved $newKeyName to .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+            }
+            $selectedKey = $newKeyName
+        } elseif (![string]::IsNullOrWhiteSpace($keyChoice)) {
+            $selectedKey = $keyChoice
+        } else {
+            return
+        }
+    } else {
+        Write-Host "No existing keys found in .env for $($provider.Name)." -ForegroundColor Yellow
+        $suffix = Read-Host "Enter key suffix/name (e.g. vikas)"
+        $suffixClean = ConvertTo-ClaudeEnvName $suffix
+        $newKeyName = if ([string]::IsNullOrWhiteSpace($suffixClean)) { $prefix } else { "${prefix}_${suffixClean}" }
+        
+        $secure = Read-Host "API key value for $newKeyName" -AsSecureString
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+        if (![string]::IsNullOrWhiteSpace($plain)) {
+            Set-ClaudeEnvValue -Name $newKeyName -Value $plain
+            Write-Host "Saved $newKeyName to .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+        }
+        $selectedKey = $newKeyName
+    }
+    
+    $profile.ApiKeyId = $selectedKey
+    $profile.ApiKeyName = $selectedKey
+    Set-ClaudeKeyMapping -Profile $fileName -Provider $provider.Id -KeyId $profile.ApiKeyId -SourceKeyName $provider.KeyName -Label $profile.Name
+    Write-Host "Profile API key id set to: $($profile.ApiKeyId)" -ForegroundColor Green
+
+    if ($provider.Mode -eq "anthropic-direct") {
+        $baseUrl = Read-Host "Base URL [$($provider.BaseUrl)]"
+        $profile.BaseUrl = if ([string]::IsNullOrWhiteSpace($baseUrl)) { $provider.BaseUrl } else { $baseUrl }
+    } elseif ($provider.Mode -eq "gemini-proxy" -or $provider.Mode -eq "huggingface-proxy" -or $provider.Mode -eq "nvidia-proxy" -or $provider.Mode -eq "mistral-proxy" -or $provider.Mode -eq "codestral-proxy" -or $provider.Mode -eq "mistral-vibe-proxy" -or $provider.Mode -eq "opencode-nemotron-proxy") {
+        $profile.BaseUrl = $provider.BaseUrl
+        $profile.ProxyScript = $provider.ProxyScript
+        $profile.ProxyPort = "$($provider.ProxyPort)"
+    } elseif ($provider.Mode -eq "openai-chat-proxy") {
+        Write-Host "`nClaude Code uses Anthropic Messages, but this provider uses OpenAI-style Chat Completions." -ForegroundColor Yellow
+        Write-Host "The shared OpenAI proxy will translate messages, tools, streaming, stop reasons, usage, and errors." -ForegroundColor Yellow
+        # Find next available port by scanning existing profiles
+        $usedPorts = @()
+        if (Test-Path -LiteralPath $PROFILES_DIR) {
+            Get-ChildItem -Path $PROFILES_DIR -Filter "*.ps1" -File | ForEach-Object {
+                $pc = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                if ($pc -match '(?mi)^\$script:PROXY_PORT\s*=\s*(\d+)') {
+                    $usedPorts += [int]$matches[1]
+                }
+            }
+        }
+        $defaultPort = if ($usedPorts.Count -gt 0) { [string](($usedPorts | Measure-Object -Maximum).Maximum + 1) } else { "18100" }
+        $proxyPort = Read-Host "Local proxy port [$defaultPort]"
+        $profile.ProxyPort = if ([string]::IsNullOrWhiteSpace($proxyPort)) { $defaultPort } else { $proxyPort }
+        # Validate port range
+        $portNum = 0
+        while (-not ([int]::TryParse($profile.ProxyPort, [ref]$portNum) -and $portNum -ge 1 -and $portNum -le 65535)) {
+            Write-Host "Invalid port: '$($profile.ProxyPort)'. Must be 1-65535." -ForegroundColor Red
+            $profile.ProxyPort = Read-Host "Local proxy port"
+        }
+        # Warn if port is already used by another profile
+        $conflict = Get-ChildItem -Path $PROFILES_DIR -Filter "*.ps1" -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.BaseName -ne $fileName -and ((Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -match "(?mi)^\`$script:PROXY_PORT\s*=\s*$([regex]::Escape($profile.ProxyPort))")
+        }
+        if ($conflict) {
+            Write-Host "  WARNING: Port $($profile.ProxyPort) is already used by profile '$($conflict.BaseName)'. Each profile needs its own port." -ForegroundColor Yellow
+        }
+        $profile.BaseUrl = "http://127.0.0.1:$($profile.ProxyPort)"
+        $upstreamBase = Read-Host "Upstream Base URL [$($provider.BaseUrl)]"
+        $profile.UpstreamBaseUrl = if ([string]::IsNullOrWhiteSpace($upstreamBase)) { $provider.BaseUrl } else { $upstreamBase }
+        $profile.ProxyScript = 'Join-Path $PSScriptRoot "..\proxy\openai-chat-proxy.js"'
+    }
+
+    $customProxy = Read-Host "Advanced: override with existing/custom proxy? (y/N)"
+    if ($customProxy -match "^y") { Set-ProfileProxyInteractive $profile }
+    
+    $defaultModels = @($provider.DefaultModels)
+    if ($provider.ModelSource -eq "dynamic") {
+        $fetchModels = Read-Host "Fetch live models for $($provider.Name)? (y/N)"
+        if ($fetchModels -match "^y") {
+            $liveModels = @(Get-ProviderModels -ProviderId $provider.Id -KeyName $profile.ApiKeyId -Quiet)
+            if ($liveModels.Count -gt 0) { $defaultModels = $liveModels }
+        }
+    }
+
+    if ($defaultModels.Count -gt 0) {
+        Write-Host "Suggested models: $($defaultModels -join ', ')" -ForegroundColor DarkGray
+    }
+    $modelsInput = Read-Host "Models (comma separated, blank for suggested)"
+    if (![string]::IsNullOrWhiteSpace($modelsInput)) {
+        $profile.Models = @($modelsInput -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    } elseif ($defaultModels.Count -gt 0) {
+        $profile.Models = @($defaultModels)
+    }
+    
+    if ($profile.Models.Count -gt 0) {
+        Write-Host "Available Models: $($profile.Models -join ', ')" -ForegroundColor DarkGray
+        $profile.DefaultModel = Read-Host "Default Model [$($profile.Models[0])]"
+        if ([string]::IsNullOrWhiteSpace($profile.DefaultModel)) { $profile.DefaultModel = $profile.Models[0] }
+    } else {
+        $profile.DefaultModel = Read-Host "Default Model"
+        if (![string]::IsNullOrWhiteSpace($profile.DefaultModel)) {
+            $profile.Models += $profile.DefaultModel
+        }
+    }
+    
+    Save-ProfileTemplate -Path $Path -profile $profile
+    Read-Host "Press Enter to continue"
+}
+
+function Edit-ProfileInteractive {
+    $entries = @(Get-ProfileEntries)
+    if ($entries.Count -eq 0) {
+        Write-Host "No profiles available to edit." -ForegroundColor Yellow
+        Read-Host "Press Enter to continue"
+        return
+    }
+    
+    if ($script:__EditProfileSelection) {
+        $sel = "$script:__EditProfileSelection"
+        Remove-Variable -Name __EditProfileSelection -Scope Script -ErrorAction SilentlyContinue
+        if (!($sel -match '^\d+$')) { return }
+        $entry = $entries | Where-Object { $_.Index -eq [int]$sel } | Select-Object -First 1
+    } else {
+        $items = @($entries | ForEach-Object {
+            [pscustomobject]@{
+                Label = ("{0}  [{1}]" -f $_.Name, $_.DefaultModel)
+                Value = $_
+            }
+        })
+        $entry = Read-MenuSelection -Title "Select profile to edit" -Items $items
+    }
+    if (!$entry) { return }
+    
+    $Path = $entry.Path
+    $profile = Load-ProfileTemplate $Path
+    
+    Write-Host "`nEditing Profile: $($entry.Name)" -ForegroundColor Cyan
+    Write-Host "Leave blank to keep current value.`n"
+    
+    $val = Read-Host "Profile Display Name [$($profile.Name)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.Name = $val }
+
+    $val = Read-Host "Provider [$($profile.Provider)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.Provider = $val }
+
+    $val = Read-Host "Mode [$($profile.Mode)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.Mode = $val }
+    
+    $val = Read-Host "Base URL [$($profile.BaseUrl)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.BaseUrl = $val }
+
+    $val = Read-Host "Upstream Base URL [$($profile.UpstreamBaseUrl)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.UpstreamBaseUrl = $val }
+    
+    $val = Read-Host "Auth Mode [$($profile.AuthMode)]"
+    if (![string]::IsNullOrWhiteSpace($val)) { $profile.AuthMode = $val }
+    
+    $providerDef = Get-ProviderDefinition -IdOrName $profile.Provider
+    $prefix = if ($providerDef) { $providerDef.KeyName } else { Get-DefaultKeyNameForProvider $profile.Provider }
+    
+    Write-Host "Current API Key ID: $($profile.ApiKeyId)" -ForegroundColor DarkGray
+    $changeKey = Read-Host "Change API key assigned to this profile? (y/N)"
+    if ($changeKey -match "^y") {
+        $existingKeys = @(Get-EnvKeysForProvider -ProviderKeyName $prefix)
+        $keyOptions = @()
+        foreach ($k in $existingKeys) {
+            $keyOptions += [pscustomobject]@{
+                Label = if ($k -eq $profile.ApiKeyId) { "Use existing key: $k (current)" } else { "Use existing key: $k" }
+                Value = $k
+            }
+        }
+        $keyOptions += [pscustomobject]@{
+            Label = "Add a new API key"
+            Value = "__ADD_NEW__"
+        }
+        
+        $keyChoice = Read-MenuSelection -Title "Select API Key for $($profile.Name)" -Items $keyOptions
+        if ($keyChoice -eq "__ADD_NEW__") {
+            $suffix = Read-Host "Enter key suffix/name (e.g. vikas)"
+            $suffixClean = ConvertTo-ClaudeEnvName $suffix
+            $newKeyName = if ([string]::IsNullOrWhiteSpace($suffixClean)) { $prefix } else { "${prefix}_${suffixClean}" }
+            
+            $secure = Read-Host "API key value for $newKeyName" -AsSecureString
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            if (![string]::IsNullOrWhiteSpace($plain)) {
+                Set-ClaudeEnvValue -Name $newKeyName -Value $plain
+                Write-Host "Saved $newKeyName to .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+            }
+            $profile.ApiKeyId = $newKeyName
+            $profile.ApiKeyName = $newKeyName
+        } elseif (![string]::IsNullOrWhiteSpace($keyChoice)) {
+            $profile.ApiKeyId = $keyChoice
+            $profile.ApiKeyName = $keyChoice
+        }
+        Set-ClaudeKeyMapping -Profile $entry.Name -Provider $profile.Provider -KeyId $profile.ApiKeyId -SourceKeyName $prefix -Label $profile.Name
+        Write-Host "Assigned API key: $($profile.ApiKeyId)" -ForegroundColor Green
+    } else {
+        $updateVal = Read-Host "Update value for $($profile.ApiKeyId) in .env? (y/N)"
+        if ($updateVal -match "^y") {
+            $secure = Read-Host "New API key value for $($profile.ApiKeyId)" -AsSecureString
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            if (![string]::IsNullOrWhiteSpace($plain)) {
+                Set-ClaudeEnvValue -Name $profile.ApiKeyId -Value $plain
+                Write-Host "Saved $($profile.ApiKeyId) to .env as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+            }
+        }
+    }
+    
+    while ($true) {
+        Write-Host "`nCurrent Models: $($profile.Models -join ', ')" -ForegroundColor Yellow
+        Write-Host "Default Model: $($profile.DefaultModel)" -ForegroundColor Green
+        $mSel = Read-MenuSelection -Title "Model edit options" -Items @(
+            [pscustomobject]@{ Label = "Add Model"; Value = "1" }
+            [pscustomobject]@{ Label = "Remove Model"; Value = "2" }
+            [pscustomobject]@{ Label = "Set Default Model"; Value = "3" }
+            [pscustomobject]@{ Label = "Done with Models"; Value = "4" }
+        )
+        if (!$mSel) { break }
+        
+        switch ($mSel) {
+            "1" {
+                $nM = Read-Host "New Model Name"
+                if (![string]::IsNullOrWhiteSpace($nM) -and $profile.Models -notcontains $nM) {
+                    $profile.Models += $nM
+                }
+            }
+            "2" {
+                $nM = Read-Host "Model Name to Remove"
+                $profile.Models = @($profile.Models | Where-Object { $_ -ne $nM })
+            }
+            "3" {
+                $nM = Read-Host "Set Default To"
+                if ($profile.Models -contains $nM) {
+                    $profile.DefaultModel = $nM
+                } else {
+                    Write-Host "Model not in list!" -ForegroundColor Red
+                }
+            }
+            "4" { break }
+        }
+        if ($mSel -eq "4") { break }
+    }
+    
+    Save-ProfileTemplate -Path $Path -profile $profile
+    Read-Host "Press Enter to continue"
+}
+
+function Delete-ProfileInteractive {
+    $entries = @(Get-ProfileEntries)
+    if ($entries.Count -eq 0) {
+        Write-Host "No profiles available to delete." -ForegroundColor Yellow
+        Read-Host "Press Enter to continue"
+        return
+    }
+    
+    $items = @($entries | ForEach-Object {
+        [pscustomobject]@{
+            Label = ("{0}  [{1}]" -f $_.Name, $_.DefaultModel)
+            Value = $_
+        }
+    })
+    $entry = Read-MenuSelection -Title "Select profile to delete" -Items $items
+    if (!$entry) { return }
+    
+    $confirm = Read-Host "Are you sure you want to delete profile '$($entry.Name)'? (y/N)"
+    if ($confirm -match "^y") {
+        Remove-Item $entry.Path -Force
+        Write-Host "Deleted $($entry.Name)" -ForegroundColor Red
+    }
+    Read-Host "Press Enter to continue"
+}
+
+function Get-ProviderModels {
+    param(
+        [string]$ProviderId,
+        [string]$KeyName,
+        [switch]$Refresh,
+        [switch]$Quiet
+    )
+
+    $provider = Get-ProviderDefinition $ProviderId
+    if (!$provider) {
+        if (!$Quiet) { Write-Host "Provider '$ProviderId' not found." -ForegroundColor Red }
+        return @()
+    }
+
+    if ($provider.ModelSource -ne "dynamic" -or [string]::IsNullOrWhiteSpace($provider.ModelsEndpoint)) {
+        if (!$Quiet) { $provider.DefaultModels | ForEach-Object { Write-Host $_ } }
+        return @($provider.DefaultModels)
+    }
+
+    $resolvedKeyName = if ($KeyName) { $KeyName } else { $provider.KeyName }
+    try {
+        $apiKey = Get-ClaudeEnvValue $resolvedKeyName
+        if ([string]::IsNullOrWhiteSpace($apiKey) -and !$KeyName) {
+            $providerAliases = @($ProviderId)
+            if ($ProviderId -eq "nvidia-nim") { $providerAliases += "nvidia" }
+            if ($ProviderId -eq "nvidia") { $providerAliases += "nvidia-nim" }
+            if ($ProviderId -eq "mistral-vibe") { $providerAliases += "mistral" }
+
+            foreach ($mapped in @(Get-ClaudeKeyMap | Where-Object { $providerAliases -contains $_.Provider })) {
+                $candidateValue = Get-ClaudeEnvValue $mapped.KeyId
+                if (![string]::IsNullOrWhiteSpace($candidateValue)) {
+                    $resolvedKeyName = $mapped.KeyId
+                    $apiKey = $candidateValue
+                    break
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($apiKey) -and $ProviderId -eq "mistral-vibe") {
+                $candidateValue = Get-ClaudeEnvValue "MISTRAL_API_KEY"
+                if (![string]::IsNullOrWhiteSpace($candidateValue)) {
+                    $resolvedKeyName = "MISTRAL_API_KEY"
+                    $apiKey = $candidateValue
+                }
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($apiKey)) {
+            throw "Missing API key '$resolvedKeyName'."
+        }
+
+        $headers = @{ Authorization = "Bearer $apiKey"; "Content-Type" = "application/json" }
+        $response = Invoke-RestMethod -Method Get -Uri $provider.ModelsEndpoint -Headers $headers -TimeoutSec 30
+        $models = @()
+        if ($response.data) {
+            $models = @($response.data | ForEach-Object { $_.id } | Where-Object { $_ })
+        } elseif ($response.models) {
+            $models = @($response.models | ForEach-Object { $_.id } | Where-Object { $_ })
+        }
+
+        if (!$Quiet) {
+            Write-Host "$($provider.Name) models:" -ForegroundColor Green
+            $models | ForEach-Object { Write-Host "  $_" }
+        }
+        return $models
+    } catch {
+        if (!$Quiet) {
+            Write-Host "Unable to fetch models for $($provider.Name): $($_.Exception.Message)" -ForegroundColor Red
+            if ($provider.DefaultModels.Count -gt 0) {
+                Write-Host "Fallback models:" -ForegroundColor Yellow
+                $provider.DefaultModels | ForEach-Object { Write-Host "  $_" }
+            }
+        }
+        return @($provider.DefaultModels)
+    }
+}
+
+function Show-ClaudeKeys {
+    Show-ApiKeysList
+}
+
+function Invoke-ClaudeDoctor {
+    Write-Host "Claude Profiles Doctor" -ForegroundColor Cyan
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    $claude = Get-ClaudeExecutablePath
+    Write-Host ("Node: {0}" -f $(if ($node) { $node.Source } else { "missing" }))
+    Write-Host ("Claude Code: {0}" -f $(if ($claude -and (Test-Path -LiteralPath $claude)) { $claude } else { "missing" }))
+    Write-Host ("Env file: {0}" -f $(if (Test-Path $script:CLAUDE_ENV_PATH) { $script:CLAUDE_ENV_PATH } else { "missing" }))
+    Repair-ClaudeSettings | Out-Null
+
+    $issues = 0
+    foreach ($entry in Get-ProfileEntries) {
+        . $entry.Path
+        $keyName = if ($script:API_KEY_ID) { $script:API_KEY_ID } else { $script:API_KEY_NAME }
+        if ([string]::IsNullOrWhiteSpace($keyName)) {
+            Write-Host "Profile $($entry.Name): missing API_KEY_ID" -ForegroundColor Red
+            $issues++
+        } elseif ([string]::IsNullOrWhiteSpace((Get-ClaudeEnvValue $keyName))) {
+            Write-Host "Profile $($entry.Name): .env missing $keyName" -ForegroundColor Yellow
+            $issues++
+        }
+
+        if ($script:PROXY_SCRIPT) {
+            $resolvedProxy = Resolve-Path -LiteralPath $script:PROXY_SCRIPT -ErrorAction SilentlyContinue
+            if (!$resolvedProxy) {
+                Write-Host "Profile $($entry.Name): proxy script not found: $script:PROXY_SCRIPT" -ForegroundColor Red
+                $issues++
+            }
+        }
+    }
+
+    if ($issues -eq 0) { Write-Host "Doctor passed." -ForegroundColor Green }
+    else { Write-Host "Doctor found $issues issue(s)." -ForegroundColor Yellow }
+}
+
+function Test-ClaudeProfile {
+    param(
+        [string]$ProfileName,
+        [string]$Model,
+        [string]$Level = "basic"
+    )
+
+    $entry = Resolve-ProfileEntry $ProfileName
+    if (!$entry) { return }
+    $selectedModel = Resolve-ModelName $entry $Model
+    if (!$selectedModel) { return }
+
+    $previous = Get-ActiveProfile
+    try {
+        Set-ActiveProfile $entry.Name $selectedModel
+        $prompt = if ($Level -eq "tools" -or $Level -eq "tool-loop") {
+            if (Test-ClaudeWindows) {
+                "Use the shell tool. Run exactly: (Get-ChildItem -Directory | Measure-Object).Count . Return only the number, no words."
+            } else {
+                "Use the shell tool. Run exactly: find . -mindepth 1 -maxdepth 1 -type d | wc -l . Return only the number, no words."
+            }
+        } else {
+            "Reply OK only."
+        }
+        ccs --bare --print $prompt
+    } finally {
+        if ($previous) { Set-ActiveProfile $previous["PROFILE"] $previous["MODEL"] }
+    }
+}
+
+function Migrate-ClaudeProfilesToV2 {
+    $migrated = 0
+    Get-ChildItem -LiteralPath $PROFILES_DIR -Filter "*.ps1" | Sort-Object Name | ForEach-Object {
+        $path = $_.FullName
+        $content = Get-Content -LiteralPath $path -Raw
+        $rawKey = if ($content -match '(?mi)^\$script:API_KEY\s*=\s*"(.*?)"') { $matches[1] } else { "" }
+        $profile = Load-ProfileTemplate $path
+        $provider = if ($profile.Provider) { $profile.Provider } else { Get-ProfileProviderGuess -ProfileName $profile.Name -BaseUrl $profile.BaseUrl -ProxyScript $profile.ProxyScript }
+        $isPlaceholder = [string]::IsNullOrWhiteSpace($rawKey) -or $rawKey -match '(?i)PASTE|YOUR|KEY_HERE|HERE$'
+
+        $profile.Provider = $provider
+        $profile.Mode = if ($profile.Mode) { $profile.Mode } else { Get-ProfileModeGuess -Provider $provider -ProxyScript $profile.ProxyScript }
+        $oldPointer = if ($profile.ApiKeyId) { $profile.ApiKeyId } elseif ($profile.ApiKeyName) { $profile.ApiKeyName } else { Get-DefaultKeyNameForProvider $provider }
+        $sourceValue = if (!$isPlaceholder) { $rawKey } else { Get-ClaudeEnvValue $oldPointer }
+
+        if ([string]::IsNullOrWhiteSpace($profile.ApiKeyId) -or $profile.ApiKeyId -notmatch '^CCKEY_') {
+            $profile.ApiKeyId = New-ClaudeProfileKeyId -ProfileName $_.BaseName -Provider $provider
+        }
+        $profile.ApiKeyName = $profile.ApiKeyId
+
+        if (![string]::IsNullOrWhiteSpace($sourceValue)) {
+            Set-ClaudeEnvValue -Name $profile.ApiKeyId -Value $sourceValue
+        }
+
+        $profile.ApiKey = ""
+        Set-ClaudeKeyMapping -Profile $_.BaseName -Provider $provider -KeyId $profile.ApiKeyId -SourceKeyName $oldPointer -Label $profile.Name
+        Save-ProfileTemplate -Path $path -profile $profile
+        $migrated++
+    }
+
+    Write-Host "Migrated $migrated profile(s) to profile-wise V2 key ids." -ForegroundColor Green
+    Write-Host "Secrets are stored in $script:CLAUDE_ENV_PATH and assignments are tracked in $script:CLAUDE_KEY_MAP_PATH." -ForegroundColor Green
+}
+
+function Write-ManageHelpTab {
+    param([string]$Text, [string]$Page, [string]$Target)
+    if ($Page -eq $Target) {
+        Write-Host " $Text " -ForegroundColor Black -BackgroundColor Blue -NoNewline
+    } else {
+        Write-Host " $Text " -ForegroundColor Gray -NoNewline
+    }
+}
+
+function Get-ManageHelpPages {
+    return @("general", "commands", "uninstall")
+}
+
+function Normalize-ManageHelpPage {
+    param([string]$Page)
+    $normalized = if ($Page) { $Page.ToLowerInvariant() } else { "general" }
+    if ($normalized -notin @(Get-ManageHelpPages)) { return "general" }
+    return $normalized
+}
+
+function Write-ManageHelpHeader {
+    param(
+        [string]$Page,
+        [switch]$Interactive
+    )
+
+    Write-Host ""
+    Write-Host " Help " -ForegroundColor Cyan -NoNewline
+    if ($Interactive) {
+        Write-Host " [<] " -ForegroundColor Black -BackgroundColor DarkGray -NoNewline
+        Write-Host " " -NoNewline
+    }
+    Write-ManageHelpTab -Text "General" -Page $Page -Target "general"
+    Write-Host " " -NoNewline
+    Write-ManageHelpTab -Text "Commands" -Page $Page -Target "commands"
+    Write-Host " " -NoNewline
+    Write-ManageHelpTab -Text "Uninstall" -Page $Page -Target "uninstall"
+    if ($Interactive) {
+        Write-Host " " -NoNewline
+        Write-Host " [>] " -ForegroundColor Black -BackgroundColor DarkGray -NoNewline
+    }
+    Write-Host "`n"
+
+    if ($Interactive) {
+        Write-Host "Use Left/Right arrows to switch pages. Press Q, Esc, or Enter to close." -ForegroundColor DarkGray
+        Write-Host ""
+    }
+}
+
+function Show-ManageHelpPage {
+    param(
+        [string]$Page,
+        [switch]$Interactive
+    )
+
+    $normalized = Normalize-ManageHelpPage $Page
+    Write-ManageHelpHeader -Page $normalized -Interactive:$Interactive
+
+    if ($normalized -eq "commands") {
+        Write-Host "Commands" -ForegroundColor Yellow
+        Write-Host "  cc-switch                         Show numbered profiles and select interactively"
+        Write-Host "  cc-switch <profile#|name> [model#|name]"
+        Write-Host "  ccs [model#|name] [claude args...] Launch Claude Code with the active profile"
+        Write-Host "  cc-status                         Show active profile and model"
+        Write-Host "  cc-manage add                     Add a provider/profile"
+        Write-Host "  cc-manage edit [profile#|name]    Edit provider, keys, proxy, and models"
+        Write-Host "  cc-manage key list                Show generated profile key ids with redacted values"
+        Write-Host "  cc-manage key set <KEY_ID>        Add/update a key value in .env"
+        Write-Host "  cc-manage models <provider>       Fetch dynamic provider models when supported"
+        Write-Host "  cc-manage settings repair         Remove Claude settings auth/model conflicts"
+        Write-Host "  cc-manage doctor                  Check keys, proxies, Node, and Claude Code"
+        Write-Host "  cc-manage test <profile> [model] --level basic|tools"
+        Write-Host ""
+        Write-Host "Examples" -ForegroundColor Yellow
+        Write-Host "  cc-switch 9 1"
+        Write-Host "  ccs 3 --print `"Reply OK only.`""
+        Write-Host "  cc-manage models groq --refresh"
+        Write-Host "  cc-manage test api-test-gemini-working gemini-2.5-flash --level tools"
+        Write-Host "  cc-manage -help general"
+        Write-Host "  cc-manage -help uninstall"
+        return
+    }
+
+    if ($normalized -eq "uninstall") {
+        Write-Host "Uninstall" -ForegroundColor Yellow
+        Write-Host "  Removing ~/.claude-profiles deletes local profiles, .env keys, key maps, and active profile state."
+        Write-Host "  Back up first if you might need those values."
+        Write-Host ""
+        Write-Host "Backup on Windows PowerShell" -ForegroundColor Yellow
+        Write-Host '  Rename-Item "$HOME\.claude-profiles" ".claude-profiles.backup"'
+        Write-Host ""
+        Write-Host "Remove on Windows PowerShell" -ForegroundColor Yellow
+        Write-Host '  $installDir = Join-Path $HOME ".claude-profiles"'
+        Write-Host '  $userPath = [Environment]::GetEnvironmentVariable("Path", "User")'
+        Write-Host '  $newUserPath = (($userPath -split ";") | Where-Object { $_ -and $_ -ne $installDir }) -join ";"'
+        Write-Host '  [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")'
+        Write-Host '  if (Test-Path -LiteralPath $installDir) { Remove-Item -LiteralPath $installDir -Recurse -Force }'
+        Write-Host ""
+        Write-Host "Remove on macOS/Linux" -ForegroundColor Yellow
+        Write-Host '  rm -rf "$HOME/.claude-profiles"'
+        Write-Host ""
+        Write-Host "Then remove this installer block from ~/.zshrc, ~/.bashrc, or ~/.profile if present:" -ForegroundColor Yellow
+        Write-Host '  # cc-manage PATH'
+        Write-Host '  export PATH="$HOME/.claude-profiles:$PATH"'
+        return
+    }
+
+    Write-Host "General" -ForegroundColor Yellow
+    Write-Host "  Profiles are stored in: $PROFILES_DIR"
+    Write-Host "  Keys are stored in:     $script:CLAUDE_ENV_PATH"
+    Write-Host "  Key assignments use generated CCKEY_* ids per profile."
+    Write-Host ""
+    Write-Host "Provider modes" -ForegroundColor Yellow
+    Write-Host "  anthropic-direct     Sends Anthropic Messages directly to compatible providers."
+    Write-Host "  gemini-proxy         Converts Anthropic Messages to Gemini generateContent."
+    Write-Host "  openai-chat-proxy    Converts Anthropic Messages to OpenAI Chat Completions."
+    Write-Host "  nvidia-proxy         NVIDIA NIM wrapper over the shared OpenAI-compatible proxy."
+    Write-Host "  mistral-proxy        Mistral wrapper over the shared OpenAI-compatible proxy."
+    Write-Host "  codestral-proxy      Codestral wrapper over the shared OpenAI-compatible proxy."
+    Write-Host "  mistral-vibe-proxy   Mistral Vibe wrapper over the shared OpenAI-compatible proxy."
+    Write-Host "  opencode-nemotron-proxy  Preserves tools while cleaning Claude-only metadata for OpenCode Nemotron."
+    Write-Host ""
+    Write-Host "Notes" -ForegroundColor Yellow
+    Write-Host "  Groq output tokens are clamped to 4096 by default and oversized requests are rejected locally."
+    Write-Host "  NVIDIA NIM uses https://integrate.api.nvidia.com/v1 through the local proxy."
+    Write-Host "  Mistral uses https://api.mistral.ai/v1 through the local proxy."
+    Write-Host "  Mistral Vibe uses https://api.mistral.ai/v1 through the local proxy with Mistral Vibe key/model defaults."
+    Write-Host "  Codestral chat uses https://codestral.mistral.ai/v1 through the local proxy; FIM is https://codestral.mistral.ai/v1/fim/completions."
+    Write-Host "  OpenCode Nemotron uses https://opencode.ai/zen/v1/chat/completions through the local proxy, preserves tool calls, and disables unsupported Claude-only metadata upstream."
+    Write-Host "  On macOS/Linux, run these scripts with PowerShell Core (pwsh) and set CLAUDE_CODE_BIN if needed."
+    Write-Host ""
+    Write-Host "Open another page with: cc-manage -help commands"
+    Write-Host "Open uninstall help with: cc-manage -help uninstall"
+}
+
+function Show-ManageHelp {
+    param(
+        [string]$Page = "general",
+        [switch]$Interactive
+    )
+
+    $normalized = Normalize-ManageHelpPage $Page
+    if (!$Interactive) {
+        Show-ManageHelpPage -Page $normalized
+        return
+    }
+
+    if (!(Test-InteractiveConsole)) {
+        Show-ManageHelpPage -Page $normalized
+        return
+    }
+
+    $pages = @(Get-ManageHelpPages)
+    $index = [array]::IndexOf($pages, $normalized)
+    if ($index -lt 0) { $index = 0 }
+    $helpTop = Ensure-ConsoleSpace 30
+
+    while ($true) {
+        Clear-ConsoleBlock -StartRow $helpTop -LineCount 60
+        Set-SafeCursorPosition 0 $helpTop
+        Show-ManageHelpPage -Page $pages[$index] -Interactive
+        $key = [Console]::ReadKey($true)
+
+        switch ($key.Key) {
+            ([ConsoleKey]::LeftArrow) {
+                $index = ($index - 1 + $pages.Count) % $pages.Count
+                continue
+            }
+            ([ConsoleKey]::RightArrow) {
+                $index = ($index + 1) % $pages.Count
+                continue
+            }
+            ([ConsoleKey]::Q) { return }
+            ([ConsoleKey]::Escape) { return }
+            ([ConsoleKey]::Enter) { return }
+        }
+    }
+}
+
+function cc-manage {
+    param(
+        [switch]$Help,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$ManageArgs
+    )
+
+    if ($Help) {
+        $hasExplicitPage = ($ManageArgs -and $ManageArgs.Count -ge 1)
+        $page = if ($hasExplicitPage) { $ManageArgs[0] } else { "general" }
+        Show-ManageHelp -Page $page -Interactive:(!$hasExplicitPage)
+        return
+    }
+
+    if (!$ManageArgs -or $ManageArgs.Count -eq 0) {
+        Start-ProfileManager
+        return
+    }
+
+    $cmd = $ManageArgs[0]
+    if ($cmd -in @("help", "--help", "-help", "/?")) {
+        $hasExplicitPage = ($ManageArgs.Count -ge 2)
+        $page = if ($hasExplicitPage) { $ManageArgs[1] } else { "general" }
+        Show-ManageHelp -Page $page -Interactive:(!$hasExplicitPage)
+        return
+    }
+
+    switch ($cmd) {
+        "add" { Add-ProfileInteractive }
+        "edit" {
+            if ($ManageArgs.Count -ge 2) {
+                $entry = Resolve-ProfileEntry $ManageArgs[1]
+                if ($entry) {
+                    $script:__EditProfileSelection = $entry.Index
+                    Edit-ProfileInteractive
+                }
+            } else { Edit-ProfileInteractive }
+        }
+        "key" {
+            $sub = if ($ManageArgs.Count -ge 2) { $ManageArgs[1] } else { "list" }
+            switch ($sub) {
+                "list" { Show-ClaudeKeys }
+                "set" {
+                    if ($ManageArgs.Count -lt 3) { Write-Host "Usage: cc-manage key set <NAME>" -ForegroundColor Yellow; return }
+                    $name = $ManageArgs[2]
+                    $secure = Read-Host "Value for $name" -AsSecureString
+                    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+                    Set-ClaudeEnvValue -Name $name -Value $plain
+                    Write-Host "Saved $name as $(Protect-ClaudeSecret $plain)" -ForegroundColor Green
+                }
+                "rename" {
+                    if ($ManageArgs.Count -lt 4) { Write-Host "Usage: cc-manage key rename <OLD> <NEW>" -ForegroundColor Yellow; return }
+                    Rename-ClaudeEnvValue -OldName $ManageArgs[2] -NewName $ManageArgs[3]
+                    Write-Host "Renamed key." -ForegroundColor Green
+                }
+                "remove" {
+                    if ($ManageArgs.Count -lt 3) { Write-Host "Usage: cc-manage key remove <NAME>" -ForegroundColor Yellow; return }
+                    Remove-ClaudeEnvValue -Name $ManageArgs[2]
+                    Write-Host "Removed $($ManageArgs[2]) from .env." -ForegroundColor Green
+                }
+                default { Write-Host "Usage: cc-manage key list|set|rename|remove" -ForegroundColor Yellow }
+            }
+        }
+        "models" {
+            if ($ManageArgs.Count -lt 2) { Write-Host "Usage: cc-manage models <provider> [--refresh]" -ForegroundColor Yellow; return }
+            Get-ProviderModels -ProviderId $ManageArgs[1] -Refresh:($ManageArgs -contains "--refresh") | Out-Null
+        }
+        "settings" {
+            $sub = if ($ManageArgs.Count -ge 2) { $ManageArgs[1] } else { "repair" }
+            switch ($sub) {
+                "repair" { Repair-ClaudeSettings | Out-Null }
+                default { Write-Host "Usage: cc-manage settings repair" -ForegroundColor Yellow }
+            }
+        }
+        "doctor" { Invoke-ClaudeDoctor }
+        "migrate" { Migrate-ClaudeProfilesToV2 }
+        "test" {
+            if ($ManageArgs.Count -lt 2) { Write-Host "Usage: cc-manage test <profile> [model] [--level basic|tools]" -ForegroundColor Yellow; return }
+            $model = if ($ManageArgs.Count -ge 3 -and $ManageArgs[2] -notmatch "^--") { $ManageArgs[2] } else { "" }
+            $level = "basic"
+            for ($i = 0; $i -lt $ManageArgs.Count; $i++) {
+                if ($ManageArgs[$i] -eq "--level" -and $i + 1 -lt $ManageArgs.Count) { $level = $ManageArgs[$i + 1] }
+            }
+            Test-ClaudeProfile -ProfileName $ManageArgs[1] -Model $model -Level $level
+        }
+        default {
+            Write-Host "Usage: cc-manage add|edit|key|models|settings|migrate|doctor|test" -ForegroundColor Yellow
+        }
+    }
+}
